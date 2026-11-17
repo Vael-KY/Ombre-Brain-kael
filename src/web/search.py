@@ -104,6 +104,12 @@ def register(mcp) -> None:
         if err:
             return err
         query = request.query_params.get("q", "")
+        # kael fork: archive=include searches the archive too, archive=only searches it alone. Only buckets
+        # that faded there count: whatever was deleted (deleted_at / tombstone) stays out, and so do faded
+        # feel / plan / letter buckets, as in breath_search. Without the parameter nothing changes.
+        archive = request.query_params.get("archive", "")
+        if archive not in ("", "include", "only"):
+            return JSONResponse({"error": "archive must be include or only"}, status_code=400)
         if not query:
             return JSONResponse({"error": "missing q parameter"}, status_code=400)
         query_error = check_query_size(query)
@@ -111,12 +117,24 @@ def register(mcp) -> None:
             return JSONResponse({"error": query_error}, status_code=400)
         try:
             list_all = getattr(sh.bucket_mgr, "list_all", None)
+            faded_ids: set[str] = set()
             if callable(list_all):
                 all_buckets = await list_all(include_archive=False)
                 allowed_bucket_ids = {
                     str(bucket.get("id")) for bucket in all_buckets
                     if not letter_lock_state(bucket, "human")["locked"]
                 }
+                if archive:
+                    from tools.breath._shared import footprint_reader
+                    footprint = footprint_reader()
+                    for bucket in await list_all(include_archive=True):
+                        bid, meta = str(bucket.get("id")), bucket.get("metadata", {}) or {}
+                        if bid in allowed_bucket_ids or meta.get("deleted_at") or meta.get("tombstone"):
+                            continue
+                        if footprint.original_kind(bid, meta) in ("feel", "plan", "letter"):
+                            continue
+                        faded_ids.add(bid)
+                    allowed_bucket_ids = faded_ids if archive == "only" else allowed_bucket_ids | faded_ids
             else:  # pragma: no cover - 兼容极简第三方 manager
                 allowed_bucket_ids = None
             vector_scores, semantic_notice = await _semantic_scores_for_dashboard(
@@ -134,12 +152,14 @@ def register(mcp) -> None:
                     limit=50,
                     vector_scores=vector_scores,
                     allowed_bucket_ids=allowed_bucket_ids,
+                    **({"include_archive": True} if archive else {}),
                 )
             result = []
             for b in matches:
                 if letter_lock_state(b, "human")["locked"]:
                     continue
-                if not _SURFACE_POLICY.evaluate_bucket(b, mode="search").allowed:
+                faded = str(b.get("id")) in faded_ids
+                if not faded and not _SURFACE_POLICY.evaluate_bucket(b, mode="search").allowed:
                     continue
                 meta = b.get("metadata", {})
                 result.append({
@@ -150,6 +170,7 @@ def register(mcp) -> None:
                     "valence": meta.get("valence", 0.5),
                     "arousal": meta.get("arousal", 0.3),
                     "content_preview": strip_wikilinks(b.get("content", ""))[:200],
+                    **({"archived": True} if faded else {}),
                 })
                 if len(result) >= 10:
                     break
